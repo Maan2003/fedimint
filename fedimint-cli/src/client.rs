@@ -96,12 +96,24 @@ pub enum ClientCmd {
         #[clap(long)]
         include_invite: bool,
     },
+    PaperEcash {
+        amount_per_bag: Amount,
+        bag_count: usize,
+        expected_notes_per_bag: usize,
+    },
+    CancelEcash {
+        operations: Vec<OperationId>,
+    },
     /// Verifies the signatures of e-cash notes, but *not* if they have been
     /// spent already
-    Validate { oob_notes: OOBNotes },
+    Validate {
+        oob_notes: OOBNotes,
+    },
     /// Splits a string containing multiple e-cash notes (e.g. from the `spend`
     /// command) into ones that contain exactly one.
-    Split { oob_notes: OOBNotes },
+    Split {
+        oob_notes: OOBNotes,
+    },
     /// Combines two or more serialized e-cash notes strings
     Combine {
         #[clap(required = true)]
@@ -122,7 +134,9 @@ pub enum ClientCmd {
         force_internal: bool,
     },
     /// Wait for incoming invoice to be paid
-    AwaitInvoice { operation_id: OperationId },
+    AwaitInvoice {
+        operation_id: OperationId,
+    },
     /// Pay a lightning invoice or lnurl via a gateway
     #[clap(hide = true)]
     LnPay {
@@ -143,7 +157,9 @@ pub enum ClientCmd {
         force_internal: bool,
     },
     /// Wait for a lightning payment to complete
-    AwaitLnPay { operation_id: OperationId },
+    AwaitLnPay {
+        operation_id: OperationId,
+    },
     /// List registered gateways
     ListGateways {
         /// Don't fetch the registered gateways from the federation
@@ -153,7 +169,9 @@ pub enum ClientCmd {
     /// Generate a new deposit address, funds sent to it can later be claimed
     DepositAddress,
     /// Wait for deposit on previously generated address
-    AwaitDeposit { operation_id: OperationId },
+    AwaitDeposit {
+        operation_id: OperationId,
+    },
     /// Withdraw funds from the federation
     Withdraw {
         #[clap(long)]
@@ -277,6 +295,69 @@ pub async fn handle_command(
             Ok(json!({
                 "notes": notes,
             }))
+        }
+        ClientCmd::PaperEcash {
+            amount_per_bag,
+            bag_count,
+            expected_notes_per_bag,
+        } => {
+            let mut bags: Vec<String> = vec![];
+            let mut current_bag = 0;
+            let mint = client.get_first_module::<MintClientModule>()?;
+            while current_bag != bag_count {
+                // fill up all tiers up this amount we need
+                // (note per tier = 3) * (sum of value of denominations up amount < 2 * amount)
+                let amount_to_reissue = 3 * 2 * amount_per_bag;
+                let (_operation_id, notes) = mint
+                    .spend_notes_with_selector(
+                        &SelectNotesWithAtleastAmount,
+                        amount_to_reissue,
+                        Duration::from_secs(10000),
+                        false,
+                        (),
+                    )
+                    .await?;
+                let operation_id = mint.reissue_external_notes(notes, ()).await?;
+                let mut updates = mint
+                    .subscribe_reissue_external_notes(operation_id)
+                    .await
+                    .unwrap()
+                    .into_stream();
+
+                while let Some(update) = updates.next().await {
+                    if let fedimint_mint_client::ReissueExternalNotesState::Failed(e) = update {
+                        bail!("Reissue failed: {e}");
+                    }
+
+                    debug!(target: LOG_CLIENT, ?update, "Reissue external notes state update");
+                }
+
+                let one_year = Duration::from_secs(60 * 60 * 24 * 365);
+                let (_operation_id, bag) = mint
+                    .spend_notes_with_selector(
+                        &SelectNotesWithExactAmount,
+                        amount_per_bag,
+                        one_year,
+                        false,
+                        (),
+                    )
+                    .await?;
+                assert_eq!(bag.notes().count_items(), expected_notes_per_bag);
+                bags.push(bag.to_string());
+                current_bag += 1;
+            }
+            assert_eq!(bags.len(), bag_count);
+            let bags = bags.join(" ");
+            Ok(json!({
+                "bags": bags,
+            }))
+        }
+        ClientCmd::CancelEcash { operations } => {
+            let mint = client.get_first_module::<MintClientModule>()?;
+            for op in operations {
+                mint.try_cancel_spend_notes(op).await;
+            }
+            Ok(json!(null))
         }
         ClientCmd::Validate { oob_notes } => {
             let amount = client
