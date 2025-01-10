@@ -22,6 +22,7 @@ let
   filterWorkspaceDepsBuildFilesRegex = [
     "Cargo.lock"
     "Cargo.toml"
+    "clippy.toml"
     ".cargo"
     ".cargo/.*"
     ".config"
